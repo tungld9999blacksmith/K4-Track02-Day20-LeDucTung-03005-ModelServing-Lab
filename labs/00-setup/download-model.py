@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 
@@ -38,7 +39,40 @@ def find_local(models_dir: pathlib.Path, filename: str) -> pathlib.Path | None:
     return None
 
 
-def fetch(repo_id: str, filename: str, models_dir: pathlib.Path) -> pathlib.Path:
+def hf_token() -> str | None:
+    """Resolve the optional Hugging Face token.
+
+    The repo is NOT gated, so a token is never required -- but an anonymous
+    download hits a lower rate limit (hence hf_hub's "set a HF_TOKEN" warning)
+    and is slower. We honour it from two places, environment first:
+
+        1. the HF_TOKEN (or legacy HUGGING_FACE_HUB_TOKEN) environment variable
+        2. an `HF_TOKEN=...` line in a .env file at the repo root (see .env.example)
+
+    Nothing else in the lab reads .env, so we parse just this one key by hand
+    rather than pull in python-dotenv.
+    """
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        tok = (os.environ.get(var) or "").strip()
+        if tok:
+            return tok
+
+    env_file = labkit.repo_root() / ".env"
+    if env_file.exists():
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            if key.strip() in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+                tok = val.strip().strip('"').strip("'")
+                if tok:
+                    return tok
+    return None
+
+
+def fetch(repo_id: str, filename: str, models_dir: pathlib.Path,
+          token: str | None) -> pathlib.Path:
     from huggingface_hub import hf_hub_download
 
     existing = find_local(models_dir, filename)
@@ -48,7 +82,8 @@ def fetch(repo_id: str, filename: str, models_dir: pathlib.Path) -> pathlib.Path
     print(f"==> Downloading {filename}")
     print(f"    {labkit.model_file_url(filename)}")
     return pathlib.Path(
-        hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(models_dir))
+        hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(models_dir),
+                        token=token)
     )
 
 
@@ -66,10 +101,17 @@ def main() -> int:
     spec = labkit.model_spec(key)
     repo = spec["repo"]
 
+    token = hf_token()
+
     print(f"==> Model: {spec['label']}  (LAB_MODEL={key})")
     print(f"    {labkit.model_repo_url(key=key)}")
     print("    Apache-2.0, not gated — no token, no license click-through.")
     print(f"    Download size: ~{spec['download_gb']} GB")
+    if token:
+        print("    Auth: using HF_TOKEN — authenticated requests, higher rate limits.")
+    else:
+        print("    Auth: anonymous (no HF_TOKEN). Fine for this repo; only set one if")
+        print("          you hit rate limits — see .env.example / docs/MANUAL-DOWNLOAD.md.")
     other = next(k for k in labkit.MODELS if k != key)
     print(f"    (other option: LAB_MODEL={other} -> {labkit.MODELS[other]['label']}, "
           f"~{labkit.MODELS[other]['download_gb']} GB)")
@@ -96,7 +138,7 @@ def main() -> int:
     else:
         try:
             for f in wanted:
-                resolved[f] = fetch(repo, f, models_dir)
+                resolved[f] = fetch(repo, f, models_dir, token)
         except ImportError:
             labkit.die("huggingface_hub not installed.", "Run: make setup")
         except Exception as exc:  # noqa: BLE001 -- surface the real cause to the student
